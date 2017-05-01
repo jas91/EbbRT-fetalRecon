@@ -1040,13 +1040,18 @@ void irtkReconstruction::GatherFrontendTimers() {
 void irtkReconstruction::GatherBackendTimers() {
   InitializeTimers(_backendExecutionTimes);
   for (int i = 0; i < (int) _numBackendNodes; i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = GATHER_TIMERS; 
+    event_manager->Spawn([this, i]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int));
+        auto dp = buf->GetMutDataPointer();
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        dp.Get<int>() = GATHER_TIMERS; 
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("GatherBackendTimers");
@@ -1272,43 +1277,46 @@ void irtkReconstruction::CoeffInitBootstrap(
 
   int diff = _slices.size();
   int factor = (int) ceil(diff / (float)(_numBackendNodes));
-  int start;
-  int end;
 
   for (int i = 0; i < (int) _numBackendNodes; i++) {
-    start = i * factor;
-    end = i * factor + factor;
-    end = (end > diff) ? diff : end;
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
-        sizeof(struct coeffInitParameters) +
-        sizeof(struct reconstructionParameters));
-    auto dp = buf->GetMutDataPointer();
+    event_manager->Spawn([this, i, diff, factor, parameters]() { 
+        auto start = i * factor;
+        auto end = i * factor + factor;
+        end = (end > diff) ? diff : end;
 
-    dp.Get<int>() = COEFF_INIT; 
-    dp.Get<int>() = 1;
-    dp.Get<struct coeffInitParameters>() = parameters;
+        auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
+          sizeof(struct coeffInitParameters) +
+          sizeof(struct reconstructionParameters));
+        auto dp = buf->GetMutDataPointer();
 
-    auto reconstructionParameters = CreateReconstructionParameters(start, end);
-    dp.Get<struct reconstructionParameters>() = reconstructionParameters;
+        dp.Get<int>() = COEFF_INIT; 
+        dp.Get<int>() = 1;
+        dp.Get<struct coeffInitParameters>() = parameters;
 
-    auto sf = std::make_unique<StaticIOBuf>(
-        reinterpret_cast<const uint8_t *>(_stackFactor.data()),
-        (size_t)(_stackFactor.size() * sizeof(float)));
+        auto reconstructionParameters = CreateReconstructionParameters(start, end);
+        dp.Get<struct reconstructionParameters>() = reconstructionParameters;
 
-    auto si = std::make_unique<StaticIOBuf>(
-        reinterpret_cast<const uint8_t *>(_stackIndex.data()),
-        (size_t)(_stackIndex.size() * sizeof(int)));
+        auto sf = std::make_unique<StaticIOBuf>(
+          reinterpret_cast<const uint8_t *>(_stackFactor.data()),
+          (size_t)(_stackFactor.size() * sizeof(float)));
 
-    buf->PrependChain(std::move(serializeSlices(start, end, _slices)));
-    buf->PrependChain(std::move(serializeImage(_reconstructed)));
-    buf->PrependChain(std::move(serializeImage(_mask)));
-    buf->PrependChain(std::move(serializeTransformations(_transformations)));
-    buf->PrependChain(std::move(sf));
-    buf->PrependChain(std::move(si));
-    _received = 0;
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        auto si = std::make_unique<StaticIOBuf>(
+            reinterpret_cast<const uint8_t *>(_stackIndex.data()),
+            (size_t)(_stackIndex.size() * sizeof(int)));
+
+        buf->PrependChain(std::move(serializeSlices(start, end, _slices)));
+        buf->PrependChain(std::move(serializeImage(_reconstructed)));
+        buf->PrependChain(std::move(serializeImage(_mask)));
+        buf->PrependChain(std::move(serializeTransformations(_transformations)));
+        buf->PrependChain(std::move(sf));
+        buf->PrependChain(std::move(si));
+        _received = 0;
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 }
 
@@ -1316,16 +1324,21 @@ void irtkReconstruction::CoeffInit(struct coeffInitParameters parameters) {
   auto start = startTimer();
 
   for (int i = 0; i < (int) _numBackendNodes; i++) {
-    auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
-        sizeof(struct coeffInitParameters));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = COEFF_INIT; 
-    dp.Get<int>() = 0;
-    dp.Get<struct coeffInitParameters>() = parameters;
+    event_manager->Spawn([this, i, parameters]() { 
+        auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
+          sizeof(struct coeffInitParameters));
+        auto dp = buf->GetMutDataPointer();
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        dp.Get<int>() = COEFF_INIT; 
+        dp.Get<int>() = 0;
+        dp.Get<struct coeffInitParameters>() = parameters;
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 }
 
@@ -1387,15 +1400,20 @@ void irtkReconstruction::SimulateSlices(bool initialize) {
   auto start = startTimer();
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(2*sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = SIMULATE_SLICES;
-    dp.Get<int>() = (int) initialize;
-    buf->PrependChain(std::move(serializeSlice(_reconstructed)));
+    event_manager->Spawn([this, i, initialize]() { 
+        auto buf = MakeUniqueIOBuf(2*sizeof(int));
+        auto dp = buf->GetMutDataPointer();
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        dp.Get<int>() = SIMULATE_SLICES;
+        dp.Get<int>() = (int) initialize;
+        buf->PrependChain(std::move(serializeSlice(_reconstructed)));
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 }
 
@@ -1442,13 +1460,18 @@ void irtkReconstruction::RestoreSliceIntensities() {
   auto start = startTimer();
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = RESTORE_SLICE_INTENSITIES;
+    event_manager->Spawn([this, i]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int));
+        auto dp = buf->GetMutDataPointer();
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        dp.Get<int>() = RESTORE_SLICE_INTENSITIES;
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 }
 
@@ -1481,15 +1504,20 @@ void irtkReconstruction::ScaleVolume() {
 void irtkReconstruction::SliceToVolumeRegistration() {
 
    for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = SLICE_TO_VOLUME_REGISTRATION;
+    event_manager->Spawn([this, i]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int));
+        auto dp = buf->GetMutDataPointer();
 
-    buf->PrependChain(std::move(serializeSlice(_reconstructed)));
+        dp.Get<int>() = SLICE_TO_VOLUME_REGISTRATION;
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        buf->PrependChain(std::move(serializeSlice(_reconstructed)));
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("SliceToVolumeRegistration");
@@ -1549,22 +1577,27 @@ void irtkReconstruction::EStepI() {
   _mins = 1.0;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
-        sizeof(struct eStepParameters));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = E_STEP_I;
-    dp.Get<struct eStepParameters>() = parameters; 
-    dp.Get<int>() = _smallSlices.size();
-	
-    auto smallSlicesData = std::make_unique<StaticIOBuf>(
-        reinterpret_cast<const uint8_t *>(_smallSlices.data()),
-        (size_t)(_smallSlices.size() * sizeof(int)));
+    event_manager->Spawn([this, i, parameters]() { 
+        auto buf = MakeUniqueIOBuf((2 * sizeof(int)) + 
+          sizeof(struct eStepParameters));
+        auto dp = buf->GetMutDataPointer();
 
-    buf->PrependChain(std::move(smallSlicesData));
+        dp.Get<int>() = E_STEP_I;
+        dp.Get<struct eStepParameters>() = parameters; 
+        dp.Get<int>() = _smallSlices.size();
 
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+        auto smallSlicesData = std::make_unique<StaticIOBuf>(
+          reinterpret_cast<const uint8_t *>(_smallSlices.data()),
+          (size_t)(_smallSlices.size() * sizeof(int)));
+
+        buf->PrependChain(std::move(smallSlicesData));
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
   
   Gather("EStepI");
@@ -1610,15 +1643,20 @@ void irtkReconstruction::EStepII() {
   parameters.meanS2CPU = _meanS2CPU;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int) + 
-        sizeof(struct eStepParameters));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = E_STEP_II;
-    dp.Get<struct eStepParameters>() = parameters; 
-	
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+    event_manager->Spawn([this, i, parameters]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int) + 
+          sizeof(struct eStepParameters));
+        auto dp = buf->GetMutDataPointer();
+
+        dp.Get<int>() = E_STEP_II;
+        dp.Get<struct eStepParameters>() = parameters; 
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("EStepII");
@@ -1673,15 +1711,20 @@ void irtkReconstruction::EStepIII() {
   parameters.den = _den;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int) + 
-        sizeof(struct eStepParameters));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = E_STEP_III;
-    dp.Get<struct eStepParameters>() = parameters; 
-	
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+    event_manager->Spawn([this, i, parameters]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int) + 
+          sizeof(struct eStepParameters));
+        auto dp = buf->GetMutDataPointer();
+
+        dp.Get<int>() = E_STEP_III;
+        dp.Get<struct eStepParameters>() = parameters; 
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("EStepIII");
@@ -1714,13 +1757,18 @@ void irtkReconstruction::Scale() {
   auto start = startTimer();
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = SCALE;
-	
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+    event_manager->Spawn([this, i]() { 
+        auto buf = MakeUniqueIOBuf(sizeof(int));
+        auto dp = buf->GetMutDataPointer();
+
+        dp.Get<int>() = SCALE;
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("Scale");
@@ -1927,14 +1975,19 @@ void irtkReconstruction::SuperResolution(int iteration) {
   irtkRealImage original = _reconstructed;
 
   for (int i = 0; i < (int) _nids.size(); i++) {
-    auto buf = MakeUniqueIOBuf(2*sizeof(int));
-    auto dp = buf->GetMutDataPointer();
+    auto cpu = Cpu::GetByIndex(i % _numFrontendCPUs);
+    auto ctxt = cpu->get_context();
 
-    dp.Get<int>() = SUPERRESOLUTION;
-    dp.Get<int>() = iteration;
-	
-    _totalBytes += buf->ComputeChainDataLength();
-    SendMessage(_nids[i], std::move(buf));
+    event_manager->Spawn([this, i, iteration]() { 
+        auto buf = MakeUniqueIOBuf(2*sizeof(int));
+        auto dp = buf->GetMutDataPointer();
+
+        dp.Get<int>() = SUPERRESOLUTION;
+        dp.Get<int>() = iteration;
+
+        _totalBytes += buf->ComputeChainDataLength();
+        SendMessage(_nids[i], std::move(buf));
+    }, ctxt, true);
   }
 
   Gather("SuperResolution");
